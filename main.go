@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type harness struct {
@@ -21,27 +24,98 @@ type target struct {
 	size    int64
 }
 
+// ANSI colors (stdlib only, no dependencies). Disabled with NO_COLOR=1,
+// TERM=dumb, or non-terminal output.
+var useColor = supportsColor()
+
+const (
+	cReset   = "0"
+	cBold    = "1"
+	cRed     = "31"
+	cGreen   = "32"
+	cYellow  = "33"
+	cBlue    = "34"
+	cMagenta = "35"
+	cCyan    = "36"
+	cGray    = "90"
+)
+
+func paint(code, s string) string {
+	if !useColor || s == "" {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+
+func bold(s string) string   { return paint(cBold, s) }
+func red(s string) string    { return paint(cRed, s) }
+func yellow(s string) string { return paint(cYellow, s) }
+func gray(s string) string   { return paint(cGray, s) }
+
+func harnessColor(name string) func(string) string {
+	switch name {
+	case "codex":
+		return func(s string) string { return paint(cGreen, s) }
+	case "opencode":
+		return func(s string) string { return paint(cBlue, s) }
+	case "antigravity":
+		return func(s string) string { return paint(cMagenta, s) }
+	default:
+		return func(s string) string { return paint(cCyan, s) }
+	}
+}
+
+// Size buckets: dim for trivia, yellow when noticeable, red when heavy.
+func sizeColor(n int64) func(string) string {
+	const (
+		mib = 1024 * 1024
+	)
+	switch {
+	case n >= 100*mib:
+		return func(s string) string { return paint(cRed, s) }
+	case n >= 10*mib:
+		return func(s string) string { return paint(cYellow, s) }
+	default:
+		return func(s string) string { return paint(cGray, s) }
+	}
+}
+
+func supportsColor() bool {
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		return false
+	}
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 func main() {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot determine home directory:", err)
+		fmt.Fprintln(os.Stderr, red("cannot determine home directory:"), err)
 		os.Exit(1)
 	}
 
 	harnesses := definitions(home)
-	fmt.Print(`
+	fmt.Print(paint(cCyan, `
    ___  ____  ___  ____  ___ ___  ____  ____  ___
   / _ \/ __ \/ _ \/ __ \/ __/ _ \/ __ \/ __/ (_-<
   \___/ .__/\___/_/ /_/\__/\___/_/ /_/\__/_/___/
      /_/
 
-`)
-	fmt.Println("opensessions (credentials and configuration are preserved)")
-	fmt.Println("Commands: scan [name], clean <name|all>, help, quit")
+`))
+	fmt.Println(bold("opensessions") + gray(" (credentials and configuration are preserved)"))
+	fmt.Println(gray("Commands: ") + bold("scan [name]") + gray(", ") + bold("clean <name|all>") + gray(", ") + bold("help") + gray(", ") + bold("quit"))
 
 	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for {
-		fmt.Print("cleaner> ")
+		fmt.Print(bold("cleaner> "))
 		if !in.Scan() {
 			break
 		}
@@ -51,9 +125,9 @@ func main() {
 		}
 		switch strings.ToLower(fields[0]) {
 		case "help":
-			fmt.Println("scan [name]       show removable artifacts")
-			fmt.Println("clean <name|all>  review and remove artifacts")
-			fmt.Println("quit              exit")
+			fmt.Println(bold("scan [name]") + "       show removable artifacts")
+			fmt.Println(bold("clean <name|all>") + "  review and remove artifacts")
+			fmt.Println(bold("quit") + "              exit")
 		case "scan":
 			name := "all"
 			if len(fields) > 1 {
@@ -67,18 +141,18 @@ func main() {
 			}
 			selected := selectHarnesses(harnesses, strings.ToLower(fields[1]))
 			if selected == nil {
-				fmt.Println("unknown harness:", fields[1])
+				fmt.Println(red("unknown harness:"), fields[1])
 				continue
 			}
 			clean(in, discover(selected, home))
 		case "quit", "exit":
 			return
 		default:
-			fmt.Println("unknown command; type help")
+			fmt.Println("unknown command; type " + bold("help"))
 		}
 	}
 	if err := in.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "input error:", err)
+		fmt.Fprintln(os.Stderr, red("input error:"), err)
 	}
 }
 
@@ -155,12 +229,16 @@ func selectHarnesses(all []harness, name string) []harness {
 }
 
 func discover(harnesses []harness, home string) []target {
-	var found []target
+	type candidate struct {
+		harness string
+		path    string
+	}
+	var candidates []candidate
 	seen := map[string]bool{}
 	for _, h := range harnesses {
 		for _, root := range h.roots {
 			if !safeRoot(root, home) {
-				fmt.Fprintf(os.Stderr, "warning: ignoring unsafe root %q\n", root)
+				fmt.Fprintf(os.Stderr, "%s: ignoring unsafe root %q\n", yellow("warning"), root)
 				continue
 			}
 			for _, item := range h.items {
@@ -172,10 +250,40 @@ func discover(harnesses []harness, home string) []target {
 					continue
 				}
 				seen[path] = true
-				found = append(found, target{harness: h.name, path: path, size: treeSize(path)})
+				candidates = append(candidates, candidate{harness: h.name, path: path})
 			}
 		}
 	}
+
+	// Size every tree concurrently: directory walks dominate scan time and
+	// are independent, so fan out over a worker pool instead of walking
+	// each target one after another.
+	found := make([]target, len(candidates))
+	workers := min(len(candidates), 4*runtime.NumCPU())
+	if workers < 1 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	jobs := make(chan int)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				found[i] = target{
+					harness: candidates[i].harness,
+					path:    candidates[i].path,
+					size:    treeSize(candidates[i].path),
+				}
+			}
+		}()
+	}
+	for i := range candidates {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
 	sort.Slice(found, func(i, j int) bool { return found[i].path < found[j].path })
 	return found
 }
@@ -190,11 +298,18 @@ func safeRoot(root, home string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// WalkDir (not Walk) avoids a stat call per directory; only regular files
+// contribute to the total.
 func treeSize(path string) int64 {
 	var total int64
-	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && info.Mode().IsRegular() {
-			total += info.Size()
+	_ = filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.Type().IsRegular() {
+			if info, err := entry.Info(); err == nil {
+				total += info.Size()
+			}
 		}
 		return nil
 	})
@@ -203,15 +318,18 @@ func treeSize(path string) int64 {
 
 func show(targets []target) {
 	if len(targets) == 0 {
-		fmt.Println("No removable artifacts found.")
+		fmt.Println(gray("No removable artifacts found."))
 		return
 	}
 	var total int64
 	for _, t := range targets {
-		fmt.Printf("%-12s %8s  %s\n", t.harness, humanSize(t.size), t.path)
+		size := sizeColor(t.size)(humanSize(t.size))
+		fmt.Printf("%s %8s  %s\n", harnessColor(t.harness)(fmt.Sprintf("%-12s", t.harness)), size, t.path)
 		total += t.size
 	}
-	fmt.Printf("%d artifact paths, %s total\n", len(targets), humanSize(total))
+	fmt.Printf("%s, %s total\n",
+		bold(fmt.Sprintf("%d artifact paths", len(targets))),
+		bold(humanSize(total)))
 }
 
 func clean(in *bufio.Scanner, targets []target) {
@@ -219,17 +337,18 @@ func clean(in *bufio.Scanner, targets []target) {
 	if len(targets) == 0 {
 		return
 	}
-	fmt.Print("Type DELETE to permanently remove exactly these paths: ")
+	fmt.Print(bold(red("Type DELETE to permanently remove exactly these paths: ")))
 	if !in.Scan() || in.Text() != "DELETE" {
-		fmt.Println("Cancelled.")
+		fmt.Println(gray("Cancelled."))
 		return
 	}
 	removed := 0
 	for _, t := range targets {
 		if err := os.RemoveAll(t.path); err != nil {
-			fmt.Fprintf(os.Stderr, "failed: %s: %v\n", t.path, err)
+			fmt.Fprintf(os.Stderr, "%s %s: %v\n", red("failed:"), t.path, err)
 			continue
 		}
+		fmt.Printf("%s  %s\n", paint(cGreen, "removed"), t.path)
 		removed++
 	}
 	fmt.Printf("Removed %d of %d artifact paths. Restart active harnesses before rescanning.\n", removed, len(targets))

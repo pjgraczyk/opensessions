@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,5 +31,29 @@ func TestDiscoverOnlyListedItems(t *testing.T) {
 	found := discover([]harness{{name: "tool", roots: []string{root}, items: []string{"sessions"}}}, home)
 	if len(found) != 1 || found[0].path != filepath.Join(root, "sessions") {
 		t.Fatalf("unexpected targets: %#v", found)
+	}
+}
+
+func BenchmarkDiscover(b *testing.B) {
+	home := b.TempDir()
+	var items []string
+	for i := range 8 {
+		dir := filepath.Join(home, ".tool", "sessions", string(rune('a'+i)))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for j := range 50 {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d.bin", j)), make([]byte, 1024), 0o600); err != nil {
+				b.Fatal(err)
+			}
+		}
+		items = append(items, filepath.Join("sessions", string(rune('a'+i))))
+	}
+	h := []harness{{name: "tool", roots: []string{filepath.Join(home, ".tool")}, items: items}}
+	b.ResetTimer()
+	for range b.N {
+		if got := discover(h, home); len(got) != 8 {
+			b.Fatalf("unexpected targets: %d", len(got))
+		}
 	}
 }
